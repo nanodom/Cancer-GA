@@ -15,3 +15,16 @@ Algoritmo Genético Co-Evolutivo Bio-Inspirado en la dinámica entre células ca
 git clone [https://github.com/tu-usuario/cancer-ga.git](https://github.com/tu-usuario/cancer-ga.git)
 cd cancer-ga
 pip install -r requirements.txt
+
+## 🐳 Ejecución con Docker
+
+Si prefieres ejecutar el algoritmo en un entorno aislado, ejecutable en cualquier plataforma y sin configurar dependencias locales, puedes utilizar **Docker**.
+
+### Requisitos Previos
+* Tienes [Docker Desktop](https://www.docker.com/products/docker-desktop/) instalado y en ejecución.
+
+### 1. Construir la imagen
+Desde la raíz del repositorio, ejecuta:
+
+```bash
+docker build -t cancer-ga .
