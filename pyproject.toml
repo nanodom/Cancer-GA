@@ -1,0 +1,110 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# --- Metadatos del Proyecto (PEP 621) ---
+[project]
+name = "cancer-ga"
+version = "0.1.0"
+description = "Algoritmo genético co-evolutivo bio-inspirado en la dinámica tumoral e inmunológica."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Tu Nombre", email = "tu.email@ejemplo.com" }
+]
+keywords = [
+    "genetic-algorithm",
+    "bio-inspired",
+    "cancer-simulation",
+    "optimization",
+    "nsga2",
+    "evolutionary-computation"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Dependencias principales de producción
+dependencies = [
+    "numpy>=1.20.0",
+    "matplotlib>=3.3.0",
+]
+
+# Dependencias opcionales (Benchmarks y Entornos de Desarrollo)
+[project.optional-dependencies]
+benchmarks = [
+    "pymoo>=0.6.0",
+]
+dev = [
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "bandit>=1.7.5",
+    "pip-audit>=2.5.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tu-usuario/cancer-ga"
+Repository = "https://github.com/tu-usuario/cancer-ga.git"
+"Bug Tracker" = "https://github.com/tu-usuario/cancer-ga/issues"
+
+
+# --- Configuración de Herramientas de Desarrollo y DevSecOps ---
+
+# Formateador Black
+[tool.black]
+line-length = 120
+target-version = ['py39', 'py310', 'py311']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+# Framework de Pruebas Pytest y Cobertura
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --cov=cancer_ga --cov-report=term-missing"
+testpaths = [
+    "tests",
+]
+python_files = ["test_*.py"]
+
+# Cobertura de Código (Coverage.py)
+[tool.coverage.run]
+branch = true
+source = ["cancer_ga"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 70
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+
+# Escáner de Seguridad Estático (Bandit SAST)
+[tool.bandit]
+targets = ["cancer_ga"]
+exclude_dirs = ["tests"]
+skips = []

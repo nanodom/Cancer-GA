@@ -1,0 +1,6 @@
+targets:
+  - "cancer_ga"
+skips: []
+# Omite alertas falsas en pruebas si aplica
+exclude_dirs:
+  - "tests"
