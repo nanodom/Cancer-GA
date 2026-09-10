@@ -187,6 +187,9 @@ class CancerGA:
             # 6. Cruce
             cancer_pop = crossover(cancer_pop, self)
 
+            # 6.1 Evaluar hijos recién creados por el cruce (fitness=None antes de esto)
+            self.evaluate(cancer_pop)
+
             # 7. Proliferación por nichos
             cancer_pop = niche_proliferation(cancer_pop, self.n_cancer, self)
 
