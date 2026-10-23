@@ -36,16 +36,20 @@ def compute_fibroblast_field(pop, ga_instance):
 
 def niche_proliferation(pop, max_pop, ga_instance):
     """Genera descendientes según crecimiento logístico por nicho."""
+    # Los hijos del cruce nacen con fitness=None; evaluar antes de ordenar por fitness
+    if any(ind.fitness is None for ind in pop):
+        ga_instance.evaluate(pop)
+
     n_niches = assign_niches(pop, ga_instance.niche_radius)
     offspring = []
-    
+
     for nid in range(n_niches):
         members = [ind for ind in pop if ind.niche_id == nid]
         n_local = len(members)
         expected_growth = ga_instance.growth_rate * n_local * (1 - n_local / ga_instance.niche_capacity)
         n_new = max(0, int(round(expected_growth)))
         members_sorted = sorted(members, key=lambda i: i.fitness, reverse=True)
-        
+
         for k in range(n_new):
             parent = members_sorted[k % len(members_sorted)]
             child_x = ga_instance._repair(parent.x + ga_instance.rng.normal(scale=parent.sigma * 0.5, size=ga_instance.n_dim))
@@ -56,5 +60,5 @@ def niche_proliferation(pop, max_pop, ga_instance):
         ga_instance.evaluate(new_pop)
         new_pop.sort(key=lambda i: i.fitness, reverse=True)
         new_pop = new_pop[:max_pop]
-        
+
     return new_pop

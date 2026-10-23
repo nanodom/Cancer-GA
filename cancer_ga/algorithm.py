@@ -7,7 +7,7 @@ from .operators.crossover import crossover
 from .operators.proliferation import niche_proliferation, compute_fibroblast_field
 from .operators.metastasis import metastasis
 from .operators.starvation import starvation
-from .utils.nsga2 import assign_rank_and_crowding
+from .utils.nsga2 import assign_rank_and_crowding, fast_non_dominated_sort, crowding_distance
 
 
 class CancerGA:
@@ -50,6 +50,9 @@ class CancerGA:
         fibro_energy_boost=0.1,
         feas_eps=1e-6,
         eq_tol=1e-4,
+        use_gradient=True,
+        mutation_prob=None,
+        archive_size=100,
         seed=None,
     ):
         self.obj_func = objective_function
@@ -57,7 +60,7 @@ class CancerGA:
         self.bounds = np.asarray(bounds, dtype=float)
         if self.bounds.ndim == 1:
             self.bounds = np.tile(self.bounds, (n_dim, 1))
-        
+
         self.n_obj = n_obj
         self.constraints = constraints or []
         self.eq_constraints = eq_constraints or []
@@ -91,9 +94,16 @@ class CancerGA:
         self.fibro_energy_boost = fibro_energy_boost
         self.feas_eps = feas_eps
         self.eq_tol = eq_tol
+        # False -> la quimiotaxis no calcula gradientes (útil con decodificadores constantes a trozos)
+        self.use_gradient = use_gradient
+        # None -> mutar todos los genes (original); p in (0,1] -> cada gen muta con probabilidad p
+        self.mutation_prob = mutation_prob
+        # Tamaño máximo del archivo élite de Pareto (solo n_obj > 1). 0 lo desactiva.
+        self.archive_size = archive_size
 
         self.rng = np.random.default_rng(seed)
         self.fibro_phi = {}
+        self.archive = []
 
     def _repair(self, x):
         """Proyecta x a los límites [bounds] y redondea variables enteras."""
@@ -118,11 +128,9 @@ class CancerGA:
     def _evaluate_objectives(self, x):
         """Evalúa la función objetivo devolviendo un arreglo 1D numpy."""
         raw = self.obj_func(x)
-        if isinstance(raw, tuple):
-            objs, extra_g = raw[0], raw[1]
-        else:
-            objs = raw
-        
+        # Las funciones tipo benchmark devuelven (objetivos, restricciones); aquí solo interesan los objetivos
+        objs = raw[0] if isinstance(raw, tuple) else raw
+
         objs_arr = np.atleast_1d(np.asarray(objs, dtype=float))
         return objs_arr
 
@@ -154,8 +162,40 @@ class CancerGA:
             pop.append(Individual(x, self.sigma_init, self.e_init, weights=w))
         return pop
 
+    def _update_archive(self, pop):
+        """Mantiene un archivo élite con los individuos factibles no dominados vistos hasta ahora."""
+        if self.n_obj < 2 or self.archive_size <= 0:
+            return
+        candidates = list(self.archive)
+        for ind in pop:
+            if ind.cv <= self.feas_eps:
+                c = Individual(ind.x.copy(), ind.sigma, ind.energy, weights=ind.weights)
+                c.obj = ind.obj.copy()
+                c.cv = ind.cv
+                candidates.append(c)
+        if not candidates:
+            return
+
+        seen, unique = set(), []
+        for c in candidates:
+            key = tuple(np.round(c.obj, 9))
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+
+        front = fast_non_dominated_sort(unique, feas_eps=self.feas_eps)[0]
+        if len(front) > self.archive_size:
+            crowd = crowding_distance(front, self.n_obj)
+            front = sorted(front, key=lambda i: crowd[id(i)], reverse=True)[: self.archive_size]
+        self.archive = front
+
+    def pareto_front(self):
+        """Devuelve el archivo élite: individuos factibles no dominados (solo n_obj > 1)."""
+        return list(self.archive)
+
     def run(self, n_generations=100, verbose=True):
         """Ejecuta el ciclo co-evolutivo de CancerGA."""
+        self.archive = []
         cancer_pop = self._init_population(self.n_cancer)
         lymph_pop = self._init_population(self.n_lymph)
 
@@ -186,8 +226,7 @@ class CancerGA:
 
             # 6. Cruce
             cancer_pop = crossover(cancer_pop, self)
-
-            # 6.1 Evaluar hijos recién creados por el cruce (fitness=None antes de esto)
+            # Los hijos nacen sin fitness: evaluar antes de ordenar por nichos (si no, sorted() falla con None)
             self.evaluate(cancer_pop)
 
             # 7. Proliferación por nichos
@@ -213,6 +252,10 @@ class CancerGA:
             self.evaluate(cancer_pop)
             self.evaluate(lymph_pop)
 
+            # Archivo élite de Pareto (multiobjetivo)
+            self._update_archive(cancer_pop)
+            self._update_archive(lymph_pop)
+
             # Registro de historia
             feasible_c = [ind for ind in cancer_pop if ind.cv <= self.feas_eps]
             if feasible_c:
@@ -228,8 +271,13 @@ class CancerGA:
 
             if verbose and (gen == 0 or (gen + 1) % 10 == 0 or gen == n_generations - 1):
                 status = "Factible" if feasible_c else "Infactible"
-                print(f"Gen {gen+1:3d}/{n_generations} | Cáncer: {len(cancer_pop):3d} | Linf: {len(lymph_pop):3d} | Valor: {best_val:.6f} ({status})")
+                extra = f" | Pareto: {len(self.archive):3d}" if self.n_obj > 1 else ""
+                print(
+                    f"Gen {gen + 1:3d}/{n_generations} | Cáncer: {len(cancer_pop):3d} | "
+                    f"Linf: {len(lymph_pop):3d} | Valor: {best_val:.6f} ({status}){extra}"
+                )
 
+        self.history = history
         feasible_c = [ind for ind in cancer_pop if ind.cv <= self.feas_eps]
         if feasible_c:
             best_ind = max(feasible_c, key=lambda i: i.fitness if self.n_obj > 1 else -i.obj[0])
@@ -237,5 +285,5 @@ class CancerGA:
         elif cancer_pop:
             best_ind = min(cancer_pop, key=lambda i: i.cv)
             return best_ind.x, best_ind.obj[0] if self.n_obj == 1 else best_ind.obj, False
-        
+
         return None
