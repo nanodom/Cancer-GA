@@ -1,28 +1,5 @@
 """
 Ejecutor de experimentos para el modelo CP de re-planificación de cosecha.
-
-Corre CancerGA para cada combinación (tipo de contrato × semilla), con
-criterio de parada por estancamiento del hipervolumen y registro por
-generación, y devuelve un diccionario 100% serializable a JSON:
-
-    {"meta": {...},                         # configuración y versiones (reproducibilidad)
-     "contracts": [ {"id", "type", "n_contracts", "label", "unit",
-                     "normalizer", "runs": [ ... una por semilla ... ],
-                     "summary": {...}} ]}
-
-Las funciones de trabajo (`run_single`) viven a nivel de módulo y reciben
-sólo datos serializables, para poder ejecutarse en procesos paralelos
-(`ProcessPoolExecutor`), también en Windows (método de arranque "spawn").
-
-Indicadores por corrida
------------------------
-- `hv` (en f1, f2)          : hipervolumen del archivo élite en el espacio de
-                              optimización. Sólo comparable ENTRE SEMILLAS de
-                              un mismo contrato.
-- `hv_oil_pvi` (aceite, PVI): hipervolumen del mismo archivo proyectado al
-                              espacio (aceite, PVI), con cotas comunes a todos
-                              los contratos. Es el indicador para COMPARAR
-                              contratos entre sí.
 """
 
 import platform
@@ -46,6 +23,7 @@ from cancer_ga.benchmarks.harvest import (
     plan_variability_index,
     simulate_plan,
 )
+from cancer_ga.utils.spacing import spacing_to_front
 from cancer_ga.utils.tracking import run_tracked
 
 CONTRACT_INFO = {
@@ -99,7 +77,9 @@ def run_single(task):
     """
     t_start = time.time()
     instance = build_instance(task["instance"])
-    baseline_plan, _, baseline_oil, _, _ = generate_baseline(instance)
+    
+    # Extraemos team_gene y priority del baseline
+    baseline_plan, _, baseline_oil, base_team, base_priority = generate_baseline(instance)
 
     ctype, n_c = task["contract_type"], task["n_contracts"]
     objective = make_harvest_objective(instance, baseline_plan, contract_type=ctype, n_contracts=n_c)
@@ -118,6 +98,18 @@ def run_single(task):
         **task["ga"],
     )
     out = run_tracked(ga, norm, **task["stop"])
+
+    # --- Inyectar el plan base en el archivo de CancerGA ---
+    # Esto iguala las condiciones con SSA, que arranca desde el plan base.
+    # Sin esto, el SSA tiene una ventaja injusta en el cálculo del Hipervolumen (HV).
+    base_x = np.concatenate([base_team, base_priority])
+    base_obj, _ = objective(base_x)
+    
+    # Comprobar si ya existe para no duplicar
+    is_duplicate = any(np.allclose(m["obj"], base_obj, atol=1e-9) for m in out["archive"])
+    if not is_duplicate:
+        out["archive"].append({"x": base_x, "obj": base_obj})
+    # ------------------------------------------------------
 
     # Post-proceso del archivo élite: PVI y aceite de cada solución no dominada
     n = instance.n_lots
@@ -139,6 +131,13 @@ def run_single(task):
     proj = np.array([[-f["oil"], f["pvi"]] for f in front])
     hv_oil_pvi = float(common_norm.hypervolume(proj))
 
+    # Spacing-to-front en el mismo espacio normalizado y con el mismo
+    # normalizador común, para que sea comparable entre contratos.
+    sp = spacing_to_front(
+        [{"oil": f["oil"], "pvi": f["pvi"]} for f in front],
+        common_norm,
+    )
+
     front.sort(key=lambda f: f["oil"])
     return {
         "contract_id": contract_id(ctype, n_c),
@@ -147,6 +146,7 @@ def run_single(task):
         "stop_reason": out["stop_reason"],
         "hv": out["best_hv"],
         "hv_oil_pvi": hv_oil_pvi,
+        "spacing": sp,
         "elapsed_s": float(time.time() - t_start),
         "log": out["log"],
         "front": front,
@@ -177,6 +177,23 @@ def _stats(values):
     }
 
 
+def _stats_spacing(runs):
+    """Stats de spacing entre semillas. Maneja corridas con frente <2 puntos
+    (spacing = None): se reportan n_valid y n_nan, y los stats se calculan
+    sobre las corridas válidas. Si no hay ninguna válida, devuelve None."""
+    vals = [r["spacing"]["spacing"] for r in runs if r["spacing"]["spacing"] is not None]
+    n_nan = len(runs) - len(vals)
+    if not vals:
+        return {
+            "mean": None, "std": None, "min": None, "max": None,
+            "n_valid": 0, "n_nan": n_nan,
+        }
+    s = _stats(vals)
+    s["n_valid"] = len(vals)
+    s["n_nan"] = n_nan
+    return s
+
+
 def summarize_runs(runs):
     """Estadísticos (media, desv. estándar muestral, mín, máx) entre semillas."""
     return {
@@ -186,6 +203,7 @@ def summarize_runs(runs):
         "pvi": _stats([r["representative"]["pvi"] for r in runs]),
         "hv": _stats([r["hv"] for r in runs]),
         "hv_oil_pvi": _stats([r["hv_oil_pvi"] for r in runs]),
+        "spacing": _stats_spacing(runs),
         "generations": _stats([r["generations_run"] for r in runs]),
         "elapsed_s": _stats([r["elapsed_s"] for r in runs]),
         "stopped_by_patience": int(sum(r["stop_reason"] == "patience" for r in runs)),
@@ -238,10 +256,12 @@ def run_experiment(
 
     def _report(done, res):
         if progress:
+            sp = res["spacing"]["spacing"]
+            sp_txt = f"{sp:.4f}" if sp is not None else "  --  "
             progress(
                 f"[{done:3d}/{total}] {res['contract_id']:<24} semilla {res['seed']:>3} | "
                 f"gens {res['generations_run']:3d} ({res['stop_reason']:<15}) | "
-                f"HV {res['hv']:.4f} | {res['elapsed_s']:5.1f}s"
+                f"HV {res['hv']:.4f} | SP {sp_txt} | {res['elapsed_s']:5.1f}s"
             )
 
     if workers <= 1:

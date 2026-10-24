@@ -1,18 +1,5 @@
 """
 Dashboard HTML autocontenido para los resultados de `cancer_ga.experiment`.
-
-Recibe el diccionario de resultados (o el JSON guardado) y produce un único
-archivo HTML sin dependencias de red: Chart.js se incrusta en el propio
-archivo (ver `utils/vendor/chart.umd.js`), así que funciona offline.
-
-Secciones
----------
-1. Comparación entre contratos: SÓLO con indicadores comparables (aceite, PVI
-   e hipervolumen en el espacio (aceite, PVI)). f2 se excluye a propósito: el
-   paper advierte que f2 no es comparable entre contratos.
-2. Detalle por contrato (selector): convergencia real por generación (HV,
-   mejor aceite, mínimo f2) con una curva por semilla, frentes de Pareto,
-   utilización de recursos, Gantt y tabla por semilla.
 """
 
 import json
@@ -62,6 +49,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
   td.num, th.num { text-align: right; font-family: 'Iosevka','SF Mono',Consolas,monospace; }
   tr:last-child td { border-bottom: none; }
   tr.best td { background: #eef2e4; }
+  td.best-sp { background: #fdf2e0; font-weight: 600; color: var(--clay); }
   .swatch { display: inline-block; width: .7rem; height: .7rem; margin-right: .45rem; vertical-align: -1px; }
   .toggle { display: flex; flex-wrap: wrap; gap: .5rem; }
   .toggle button { font-family: inherit; font-size: .85rem; padding: .4rem .85rem; border: 1px solid var(--line);
@@ -85,11 +73,11 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <main>
   <div class="callout">
     <b>Cómo leer este dashboard.</b> El paper advierte que <b>f2 no es comparable entre tipos de contrato</b>:
-    cada contrato mide la discrepancia con otra fórmula y otras unidades (toneladas, hectáreas u horas). Por eso
-    la comparación entre contratos usa sólo indicadores que se definen igual para todos:
-    la <b>producción de aceite</b>, el <b>PVI</b> (Plan Variability Index: desviación absoluta diaria promedio
-    entre el plan nuevo y el base, en toneladas de aceituna por día) y el <b>hipervolumen en el espacio
-    (aceite, PVI)</b>. El detalle de f2 se muestra sólo dentro de cada contrato.
+    cada contrato mide la discrepancia con otra fórmula y otras unidades. Por eso la comparación entre contratos usa
+    sólo indicadores que se definen igual para todos: <b>producción de aceite</b>, <b>PVI</b>,
+    <b>hipervolumen en (aceite, PVI)</b> y <b>spacing-to-front</b> (uniformidad del frente: menor es mejor).
+    El detalle de f2 se muestra sólo dentro de cada contrato. Si el experimento incluyó el baseline SSA,
+    verás sus resultados comparados directamente.
   </div>
 
   <section class="cards" id="cards"></section>
@@ -101,18 +89,24 @@ _TEMPLATE = r"""<!DOCTYPE html>
       <div class="scroll-x"><table id="cmpTable"></table></div>
       <p class="note">Solución evaluada: el punto de compromiso de cada corrida (el más cercano al ideal en el espacio
       normalizado del propio contrato). <b>HV (aceite, PVI)</b> mide, con cotas comunes a todos los contratos, cuánto
-      del espacio aceite–estabilidad logra cubrir el archivo final de cada corrida: mayor es mejor.</p>
+      del espacio aceite–estabilidad cubre el archivo final de cada corrida (mayor es mejor). <b>Spacing</b> mide la
+      uniformidad de la distribución del frente en ese mismo espacio (menor es mejor).</p>
     </div>
     <div class="panel">
-      <h3>Aceite vs. PVI (soluciones no dominadas, todas las semillas)</h3>
+      <h3>Aceite vs. PVI (soluciones no dominadas)</h3>
       <canvas id="cmpScatter"></canvas>
-      <p class="note">Más aceite (derecha) y menos PVI (abajo) es mejor. Un contrato cuya nube esté más abajo y a la
-      derecha permite producir más con menor variabilidad del plan.</p>
+      <p class="note">Más aceite (derecha) y menos PVI (abajo) es mejor. Los círculos son CancerGA y los rombos SSA.</p>
     </div>
     <div class="panel">
       <h3>Hipervolumen en (aceite, PVI) por contrato</h3>
       <canvas id="cmpHv"></canvas>
       <p class="note">Barras = media entre semillas; el segmento muestra mínimo–máximo.</p>
+    </div>
+    <div class="panel panel-full">
+      <h3>Spacing-to-front (aceite, PVI) por contrato</h3>
+      <canvas id="cmpSpacing"></canvas>
+      <p class="note">Menor es mejor: indica un frente más uniformemente distribuido. Contratos con frentes
+      degenerados (un solo punto no dominado) aparecen sin barra y con <code>n = –</code> en la tabla.</p>
     </div>
   </section>
 
@@ -122,8 +116,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
     <div class="panel">
       <h3>Convergencia: hipervolumen por generación</h3>
       <canvas id="convHv"></canvas>
-      <p class="note">Una curva por semilla (tenue) y la media (gruesa). HV en el espacio (aceite, f2) normalizado con
-      cotas fijas: sólo comparable entre semillas de este mismo contrato.</p>
+      <p class="note">Una curva por semilla (tenue) y la media (gruesa). HV en el espacio (aceite, f2) normalizado
+      con cotas fijas: sólo comparable entre semillas de este mismo contrato.</p>
     </div>
     <div class="panel">
       <h3>Convergencia: mejor aceite del archivo</h3>
@@ -151,7 +145,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
       con mayor hipervolumen.</p>
     </div>
     <div class="panel panel-full">
-      <h3>Resultados por semilla</h3>
+      <h3>Resultados por semilla (CancerGA)</h3>
       <div class="scroll-x"><table id="seedTable"></table></div>
     </div>
   </section>
@@ -166,12 +160,26 @@ CONTRACTS.forEach((c, i) => { c.color = PALETTE[i % PALETTE.length]; });
 
 const fmt = (v, d = 1) => (v === null || v === undefined || Number.isNaN(v)) ? "–" :
   Number(v).toLocaleString("es-CL", { minimumFractionDigits: d, maximumFractionDigits: d });
-const pm = (s, d = 1) => `${fmt(s.mean, d)} ± ${fmt(s.std, d)}`;
+const pm = (s, d = 1) => (s && s.mean != null)
+  ? `${fmt(s.mean, d)} ± ${fmt(s.std, d)}` : "–";
 const alpha = (hex, a) => hex + Math.round(a * 255).toString(16).padStart(2, "0");
+const hasSpacing = c => !!(c.summary && c.summary.spacing);
+
+function spacingRange(c, method) {
+  const src = method === "SSA" ? c.baseline_ssa : c;
+  if (!src || !src.summary || !src.summary.spacing) return null;
+  const sp = src.summary.spacing;
+  if (sp.mean == null) return null;
+  // Para SSA usamos las corridas individuales si están disponibles, si no, el rango del summary
+  const vals = src.runs ? src.runs.map(r => r.spacing && r.spacing.spacing).filter(v => v != null) : [];
+  if (vals.length) return { min: Math.min(...vals), max: Math.max(...vals) };
+  return { min: sp.mean - (sp.std || 0), max: sp.mean + (sp.std || 0) };
+}
 
 const charts = {};
-function mk(id, cfg) {
+function mk(id, cfg, plugins) {
   if (charts[id]) charts[id].destroy();
+  if (plugins) cfg.plugins = plugins;
   charts[id] = new Chart(document.getElementById(id), cfg);
 }
 const axis = (text) => ({ title: { display: true, text } });
@@ -195,60 +203,161 @@ function renderHeader() {
 
 /* ---------- 1. Comparación entre contratos ---------- */
 function renderComparison() {
-  const best = Math.max(...CONTRACTS.map(c => c.summary.hv_oil_pvi.mean));
-  let html = `<tr><th>Contrato</th><th class="num">Aceite</th><th class="num">Δ vs. base</th>` +
+  const hasSSA = CONTRACTS.some(c => c.baseline_ssa);
+
+  const bestHv = Math.max(...CONTRACTS.map(c => c.summary.hv_oil_pvi.mean));
+  const spMeans = CONTRACTS.filter(hasSpacing).map(c => c.summary.spacing.mean).filter(v => v != null);
+  const bestSp = spMeans.length ? Math.min(...spMeans) : null;
+
+  let html = `<tr><th>Contrato</th><th>Método</th><th class="num">Aceite</th><th class="num">Δ vs. base</th>` +
     `<th class="num">PVI (t/día)</th><th class="num">HV (aceite, PVI)</th>` +
+    `<th class="num">Spacing</th>` +
     `<th class="num">Generaciones</th><th class="num">Paradas por paciencia</th></tr>`;
+
   CONTRACTS.forEach(c => {
     const s = c.summary, delta = s.oil.mean - META.baseline_oil;
-    html += `<tr class="${s.hv_oil_pvi.mean === best ? "best" : ""}">` +
+    const sp = hasSpacing(c) ? s.spacing : null;
+    const spText = sp && sp.mean != null
+      ? (sp.n_nan > 0 ? `${pm(sp, 4)} <span class="note">(n=${sp.n_valid})</span>` : pm(sp, 4))
+      : "–";
+    const spCellClass = (sp && sp.mean != null && sp.mean === bestSp) ? "num best-sp" : "num";
+
+    // Fila CancerGA
+    html += `<tr class="${s.hv_oil_pvi.mean === bestHv ? "best" : ""}">` +
       `<td><span class="swatch" style="background:${c.color}"></span>${c.label}</td>` +
+      `<td>CancerGA</td>` +
       `<td class="num">${pm(s.oil, 0)}</td>` +
       `<td class="num">${delta >= 0 ? "+" : ""}${fmt(delta, 0)}</td>` +
       `<td class="num">${pm(s.pvi, 1)}</td>` +
       `<td class="num">${pm(s.hv_oil_pvi, 3)}</td>` +
+      `<td class="${spCellClass}">${spText}</td>` +
       `<td class="num">${fmt(s.generations.mean, 1)}</td>` +
       `<td class="num">${s.stopped_by_patience}/${s.n_runs}</td></tr>`;
+
+    // Fila SSA (si existe)
+    if (c.baseline_ssa) {
+      const bs = c.baseline_ssa.summary;
+      const bdelta = bs.oil.mean - META.baseline_oil;
+      const bsp = bs.spacing;
+      const bspText = bsp && bsp.mean != null ? pm(bsp, 4) : "–";
+      const bspCellClass = (bsp && bsp.mean != null && bsp.mean === bestSp) ? "num best-sp" : "num";
+
+      html += `<tr>` +
+        `<td></td>` +
+        `<td>SSA</td>` +
+        `<td class="num">${pm(bs.oil, 0)}</td>` +
+        `<td class="num">${bdelta >= 0 ? "+" : ""}${fmt(bdelta, 0)}</td>` +
+        `<td class="num">${pm(bs.pvi, 1)}</td>` +
+        `<td class="num">${pm(bs.hv_oil_pvi, 3)}</td>` +
+        `<td class="${bspCellClass}">${bspText}</td>` +
+        `<td class="num">–</td>` +
+        `<td class="num">–</td></tr>`;
+    }
   });
   document.getElementById("cmpTable").innerHTML = html;
 
+  // Scatter
+  const scatterDatasets = CONTRACTS.map(c => ({
+    label: c.label, backgroundColor: alpha(c.color, 0.55), borderColor: c.color, pointRadius: 3,
+    data: c.runs.flatMap(r => r.front.map(p => ({ x: p.oil, y: p.pvi }))),
+  }));
+  if (hasSSA) {
+    CONTRACTS.forEach(c => {
+      if (!c.baseline_ssa) return;
+      scatterDatasets.push({
+        label: `${c.label} (SSA)`,
+        backgroundColor: alpha(c.color, 0.8),
+        borderColor: "#2a2822",
+        pointStyle: "rectRot", // Rombo para SSA
+        pointRadius: 3,
+        data: c.baseline_ssa.runs.flatMap(r => r.front.map(p => ({ x: p.oil, y: p.pvi }))),
+      });
+    });
+  }
   mk("cmpScatter", {
     type: "scatter",
-    data: { datasets: CONTRACTS.map(c => ({
-      label: c.label, backgroundColor: alpha(c.color, 0.55), borderColor: c.color, pointRadius: 3,
-      data: c.runs.flatMap(r => r.front.map(p => ({ x: p.oil, y: p.pvi }))),
-    })) },
+    data: { datasets: scatterDatasets },
     options: { responsive: true, scales: { x: axis("Aceite producido"), y: axis("PVI (t/día)") },
                plugins: { legend: { position: "bottom" } } },
   });
 
-  // Barras de HV medio con rango min–max dibujado por un plugin mínimo
-  const rangePlugin = {
+  // Plugin de rangos adaptado para iterar sobre múltiples datasets
+  const makeRangePlugin = (getRangeFn) => ({
     id: "rangeBars",
     afterDatasetsDraw(chart) {
       const { ctx, scales: { y } } = chart;
-      const meta = chart.getDatasetMeta(0);
       ctx.save(); ctx.strokeStyle = "#2a2822"; ctx.lineWidth = 1.5;
-      meta.data.forEach((bar, i) => {
-        const s = CONTRACTS[i].summary.hv_oil_pvi;
-        const x = bar.x, y0 = y.getPixelForValue(s.min), y1 = y.getPixelForValue(s.max);
-        ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1);
-        ctx.moveTo(x - 5, y0); ctx.lineTo(x + 5, y0); ctx.moveTo(x - 5, y1); ctx.lineTo(x + 5, y1);
-        ctx.stroke();
+      chart.data.datasets.forEach((dataset, i) => {
+        const meta = chart.getDatasetMeta(i);
+        if (meta.hidden) return;
+        meta.data.forEach((bar, j) => {
+          const c = CONTRACTS[j];
+          const r = getRangeFn(c, dataset.label);
+          if (!r || r.min == null || r.max == null) return;
+          const y0 = y.getPixelForValue(r.min), y1 = y.getPixelForValue(r.max);
+          ctx.beginPath(); ctx.moveTo(bar.x, y0); ctx.lineTo(bar.x, y1);
+          ctx.moveTo(bar.x - 5, y0); ctx.lineTo(bar.x + 5, y0);
+          ctx.moveTo(bar.x - 5, y1); ctx.lineTo(bar.x + 5, y1);
+          ctx.stroke();
+        });
       });
       ctx.restore();
     },
-  };
+  });
+
+  const hvDatasets = [{
+    label: 'CancerGA',
+    data: CONTRACTS.map(c => c.summary.hv_oil_pvi.mean),
+    backgroundColor: CONTRACTS.map(c => c.color),
+  }];
+  const spDatasets = [{
+    label: 'CancerGA',
+    data: CONTRACTS.map(c => hasSpacing(c) ? c.summary.spacing.mean : null),
+    backgroundColor: CONTRACTS.map(c => hasSpacing(c) ? c.color : "#cfc9b4"),
+  }];
+
+  if (hasSSA) {
+    hvDatasets.push({
+      label: 'SSA',
+      data: CONTRACTS.map(c => c.baseline_ssa ? c.baseline_ssa.summary.hv_oil_pvi.mean : null),
+      backgroundColor: CONTRACTS.map(c => alpha(c.color, 0.5)),
+      borderColor: CONTRACTS.map(c => c.color),
+      borderWidth: 1
+    });
+    spDatasets.push({
+      label: 'SSA',
+      data: CONTRACTS.map(c => c.baseline_ssa ? c.baseline_ssa.summary.spacing.mean : null),
+      backgroundColor: CONTRACTS.map(c => alpha(c.color, 0.5)),
+      borderColor: CONTRACTS.map(c => c.color),
+      borderWidth: 1
+    });
+  }
+
   mk("cmpHv", {
     type: "bar",
-    data: { labels: CONTRACTS.map(c => c.label),
-            datasets: [{ data: CONTRACTS.map(c => c.summary.hv_oil_pvi.mean),
-                         backgroundColor: CONTRACTS.map(c => c.color) }] },
-    options: { responsive: true, scales: { y: { beginAtZero: true, title: { display: true, text: "HV (aceite, PVI)" } },
-                                          x: { ticks: { autoSkip: false, maxRotation: 40, minRotation: 25 } } },
-               plugins: { legend: { display: false } } },
-    plugins: [rangePlugin],
-  });
+    data: { labels: CONTRACTS.map(c => c.label), datasets: hvDatasets },
+    options: { responsive: true,
+               scales: { y: { beginAtZero: true, title: { display: true, text: "HV (aceite, PVI)" } },
+                         x: { ticks: { autoSkip: false, maxRotation: 40, minRotation: 25 } } },
+               plugins: { legend: { display: hasSSA } } },
+  }, [makeRangePlugin((c, label) => {
+      if (label === 'CancerGA') return { min: c.summary.hv_oil_pvi.min, max: c.summary.hv_oil_pvi.max };
+      if (label === 'SSA' && c.baseline_ssa) return { min: c.baseline_ssa.summary.hv_oil_pvi.min, max: c.baseline_ssa.summary.hv_oil_pvi.max };
+      return null;
+  })]);
+
+  mk("cmpSpacing", {
+    type: "bar",
+    data: { labels: CONTRACTS.map(c => c.label), datasets: spDatasets },
+    options: { responsive: true,
+               scales: { y: { beginAtZero: true, title: { display: true, text: "Spacing (menor = más uniforme)" } },
+                         x: { ticks: { autoSkip: false, maxRotation: 40, minRotation: 25 } } },
+               plugins: { legend: { display: hasSSA } } },
+  }, [makeRangePlugin((c, label) => {
+      if (label === 'CancerGA') return spacingRange(c, 'CancerGA');
+      if (label === 'SSA') return spacingRange(c, 'SSA');
+      return null;
+  })]);
 }
 
 /* ---------- 2. Detalle por contrato ---------- */
@@ -341,21 +450,29 @@ function renderGantt(run, c) {
 
 function renderSeedTable(c, br) {
   const stopTxt = { patience: "sin mejora de HV", max_generations: "máx. generaciones" };
+  const showSpacing = hasSpacing(c);
   let html = `<tr><th>Semilla</th><th class="num">Generaciones</th><th>Parada</th><th class="num">HV (f1, f2)</th>` +
     `<th class="num">HV (aceite, PVI)</th><th class="num">Aceite</th><th class="num">f2 (${c.unit})</th>` +
-    `<th class="num">PVI (t/día)</th><th class="num">Frente</th><th class="num">Tiempo (s)</th></tr>`;
+    `<th class="num">PVI (t/día)</th>` +
+    (showSpacing ? `<th class="num">Spacing</th>` : "") +
+    `<th class="num">Frente</th><th class="num">Tiempo (s)</th></tr>`;
   c.runs.forEach(r => {
+    const sp = r.spacing && r.spacing.spacing != null ? fmt(r.spacing.spacing, 4) : "–";
     html += `<tr class="${r === br ? "best" : ""}"><td>${r.seed}</td><td class="num">${r.generations_run}</td>` +
       `<td>${stopTxt[r.stop_reason] || r.stop_reason}</td><td class="num">${fmt(r.hv, 4)}</td>` +
       `<td class="num">${fmt(r.hv_oil_pvi, 4)}</td><td class="num">${fmt(r.representative.oil, 0)}</td>` +
       `<td class="num">${fmt(r.representative.f2, 1)}</td><td class="num">${fmt(r.representative.pvi, 1)}</td>` +
+      (showSpacing ? `<td class="num">${sp}</td>` : "") +
       `<td class="num">${r.front.length}</td><td class="num">${fmt(r.elapsed_s, 1)}</td></tr>`;
   });
   const s = c.summary;
+  const spSummary = showSpacing ? pm(s.spacing, 4) : "–";
   html += `<tr><td><b>media ± desv.</b></td><td class="num">${fmt(s.generations.mean, 1)}</td><td></td>` +
     `<td class="num">${pm(s.hv, 4)}</td><td class="num">${pm(s.hv_oil_pvi, 4)}</td>` +
     `<td class="num">${pm(s.oil, 0)}</td><td class="num">${pm(s.f2, 1)}</td>` +
-    `<td class="num">${pm(s.pvi, 1)}</td><td></td><td class="num">${pm(s.elapsed_s, 1)}</td></tr>`;
+    `<td class="num">${pm(s.pvi, 1)}</td>` +
+    (showSpacing ? `<td class="num">${spSummary}</td>` : "") +
+    `<td></td><td class="num">${pm(s.elapsed_s, 1)}</td></tr>`;
   document.getElementById("seedTable").innerHTML = html;
 }
 
@@ -380,8 +497,7 @@ renderDetail(0);
 
 
 def build_dashboard_html(results, output_path):
-    """Escribe el dashboard HTML autocontenido a partir de `results` (dict
-    devuelto por `cancer_ga.experiment.run_experiment`, o el JSON guardado)."""
+    """Escribe el dashboard HTML autocontenido a partir de `results`."""
     if not _CHARTJS_PATH.exists():
         raise FileNotFoundError(
             f"No se encontró Chart.js empaquetado en {_CHARTJS_PATH}. "
