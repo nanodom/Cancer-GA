@@ -1,5 +1,9 @@
 """
 Ejecutor de experimentos para el modelo CP de re-planificación de cosecha.
+
+Corre CancerGA para cada combinación (tipo de contrato × semilla), con
+criterio de parada por estancamiento del hipervolumen y registro por
+generación, y devuelve un diccionario 100% serializable a JSON.
 """
 
 import platform
@@ -23,6 +27,7 @@ from cancer_ga.benchmarks.harvest import (
     plan_variability_index,
     simulate_plan,
 )
+from cancer_ga.utils.metrics import nondominated_mask
 from cancer_ga.utils.spacing import spacing_to_front
 from cancer_ga.utils.tracking import run_tracked
 
@@ -70,15 +75,9 @@ def plan_to_gantt(plan, n_resources, n_days):
 # Una corrida (contrato, semilla)
 # --------------------------------------------------------------------------
 def run_single(task):
-    """Ejecuta una corrida y devuelve un dict serializable.
-
-    `task` = {"instance": {...}, "contract_type", "n_contracts", "seed",
-              "ga": {...}, "stop": {...}, "norm_samples": int}
-    """
+    """Ejecuta una corrida y devuelve un dict serializable."""
     t_start = time.time()
     instance = build_instance(task["instance"])
-    
-    # Extraemos team_gene y priority del baseline
     baseline_plan, _, baseline_oil, base_team, base_priority = generate_baseline(instance)
 
     ctype, n_c = task["contract_type"], task["n_contracts"]
@@ -95,23 +94,25 @@ def run_single(task):
         n_obj=2,
         is_integer=harvest_is_integer(instance),
         seed=task["seed"],
+        use_gradient=False,  # FIX 2: Apagar gradiente para igualar presupuesto
         **task["ga"],
     )
     out = run_tracked(ga, norm, **task["stop"])
 
-    # --- Inyectar el plan base en el archivo de CancerGA ---
-    # Esto iguala las condiciones con SSA, que arranca desde el plan base.
-    # Sin esto, el SSA tiene una ventaja injusta en el cálculo del Hipervolumen (HV).
+    # FIX 3: Inyectar el plan base en el archivo de CancerGA
     base_x = np.concatenate([base_team, base_priority])
     base_obj, _ = objective(base_x)
     
-    # Comprobar si ya existe para no duplicar
     is_duplicate = any(np.allclose(m["obj"], base_obj, atol=1e-9) for m in out["archive"])
     if not is_duplicate:
         out["archive"].append({"x": base_x, "obj": base_obj})
-    # ------------------------------------------------------
 
-    # Post-proceso del archivo élite: PVI y aceite de cada solución no dominada
+    # FIX 3: Re-filtrar dominancia tras la inyección
+    arch_objs = np.array([m["obj"] for m in out["archive"]])
+    keep_mask = nondominated_mask(arch_objs)
+    out["archive"] = [m for i, m in enumerate(out["archive"]) if keep_mask[i]]
+
+    # Post-proceso del archivo élite: PVI y aceite
     n = instance.n_lots
     front, details = [], []
     for member in out["archive"]:
@@ -121,24 +122,41 @@ def run_single(task):
         front.append({"oil": float(oil), "f2": float(member["obj"][1]), "pvi": pvi})
         details.append((x, plan, totals))
 
-    # Solución de compromiso: la más cercana al ideal en el espacio normalizado
-    arch_objs = np.array([m["obj"] for m in out["archive"]])
-    dist = np.linalg.norm(norm(arch_objs), axis=1)
-    rep_i = int(np.argmin(dist))
+    # FIX 4: Representante (Knee) en espacio común (aceite, PVI) excluyendo plan base (pvi=0)
+    valid_reps = [i for i, f in enumerate(front) if f["pvi"] > 1e-9]
+    if not valid_reps:
+        valid_reps = list(range(len(front)))
+
+    objs_pvi = np.array([[-front[i]["oil"], front[i]["pvi"]] for i in valid_reps])
+    norm_pvi = common_norm(objs_pvi)
+    rep_i_valid = int(np.argmin(np.linalg.norm(norm_pvi, axis=1)))
+    rep_i = valid_reps[rep_i_valid]
+
     rep_x, rep_plan, rep_totals = details[rep_i]
 
-    # HV en (aceite, PVI) con cotas comunes a todos los contratos
-    proj = np.array([[-f["oil"], f["pvi"]] for f in front])
-    hv_oil_pvi = float(common_norm.hypervolume(proj))
-
-    # Spacing-to-front en el mismo espacio normalizado y con el mismo
-    # normalizador común, para que sea comparable entre contratos.
+    # FIX 5: Spacing sobre los puntos no dominados en el espacio (aceite, PVI)
+    pvi_objs = np.array([[-f["oil"], f["pvi"]] for f in front])
+    nd_mask_pvi = nondominated_mask(pvi_objs)
+    front_nd_pvi = [front[i] for i in range(len(front)) if nd_mask_pvi[i]]
+    
     sp = spacing_to_front(
-        [{"oil": f["oil"], "pvi": f["pvi"]} for f in front],
+        [{"oil": f["oil"], "pvi": f["pvi"]} for f in front_nd_pvi],
         common_norm,
     )
 
+    # HV en (aceite, PVI) con todos los puntos (incluyendo el baseline)
+    proj = np.array([[-f["oil"], f["pvi"]] for f in front])
+    hv_oil_pvi = float(common_norm.hypervolume(proj))
+
+    # Representantes para el análisis estadístico
+    reps = {
+        "knee": front[rep_i],
+        "min_pvi": min(front, key=lambda p: p["pvi"]),
+        "max_oil": max(front, key=lambda p: p["oil"])
+    }
+
     front.sort(key=lambda f: f["oil"])
+    
     return {
         "contract_id": contract_id(ctype, n_c),
         "seed": task["seed"],
@@ -150,14 +168,8 @@ def run_single(task):
         "elapsed_s": float(time.time() - t_start),
         "log": out["log"],
         "front": front,
-        "representative": {
-            "oil": float(-out["archive"][rep_i]["obj"][0]),
-            "f2": float(out["archive"][rep_i]["obj"][1]),
-            "pvi": plan_variability_index(instance, rep_plan, baseline_plan),
-            "resource_totals": [float(v) for v in rep_totals],
-            "gantt": plan_to_gantt(rep_plan, instance.n_resources, instance.horizon_days),
-            "x": [float(v) for v in rep_x],
-        },
+        "representative": reps["knee"],
+        "representatives": reps,
         "normalizer": norm.to_dict(),
         "common_normalizer": common_norm.to_dict(),
         "_baseline_oil": float(baseline_oil),
@@ -178,9 +190,7 @@ def _stats(values):
 
 
 def _stats_spacing(runs):
-    """Stats de spacing entre semillas. Maneja corridas con frente <2 puntos
-    (spacing = None): se reportan n_valid y n_nan, y los stats se calculan
-    sobre las corridas válidas. Si no hay ninguna válida, devuelve None."""
+    """Stats de spacing entre semillas. Maneja corridas con frente <2 puntos."""
     vals = [r["spacing"]["spacing"] for r in runs if r["spacing"]["spacing"] is not None]
     n_nan = len(runs) - len(vals)
     if not vals:
@@ -232,7 +242,6 @@ def run_experiment(
 
     specs = []
     for ctype in contract_types:
-        # punctual no depende del nº de contratos: se corre una sola vez
         for n_c in ((1,) if ctype == "punctual" else n_contracts_list):
             specs.append((ctype, n_c))
 
