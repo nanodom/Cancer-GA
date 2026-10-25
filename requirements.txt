@@ -1,5 +1,5 @@
 numpy>=1.20.0
 matplotlib>=3.3.0
 pymoo>=0.6.0  # opcional, para benchmarks de la familia MW
-openpyxl>=3.0
+openpyxl>=3.1.5
 pandas>=1.5
