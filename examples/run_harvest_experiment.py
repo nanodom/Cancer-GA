@@ -47,7 +47,6 @@ from cancer_ga.benchmarks.harvest import (
 from cancer_ga.experiment import run_experiment
 from cancer_ga.utils.dashboard import build_dashboard_html
 
-
 DEFAULT_XLSX = Path(__file__).resolve().parent.parent / "data" / "datos_Tabali.xlsx"
 
 
@@ -59,15 +58,20 @@ def parse_args():
 
     # --- Instancia y contratos ---
     p.add_argument(
-        "--instance", choices=["tabali", "paper"], default="tabali",
+        "--instance",
+        choices=["tabali", "paper"],
+        default="tabali",
         help="tabali = datos reales (28 cuarteles); paper = instancia sintética de 63 lotes",
     )
     p.add_argument("--xlsx", default=str(DEFAULT_XLSX), help="ruta a datos_Tabali.xlsx")
     p.add_argument("--horizon-days", type=int, default=45)
-    p.add_argument("--contracts", nargs="+", choices=CONTRACT_TYPES,
-                   default=list(CONTRACT_TYPES))
+    p.add_argument("--contracts", nargs="+", choices=CONTRACT_TYPES, default=list(CONTRACT_TYPES))
     p.add_argument(
-        "--n-contracts", nargs="+", type=int, choices=[1, 2, 3], default=[1],
+        "--n-contracts",
+        nargs="+",
+        type=int,
+        choices=[1, 2, 3],
+        default=[1],
         help="agrupación de recursos en 1, 2 o 3 contratos (no aplica a 'punctual')",
     )
 
@@ -76,46 +80,76 @@ def parse_args():
     p.add_argument("--seed-start", type=int, default=0)
     p.add_argument("--max-generations", type=int, default=100)
     p.add_argument(
-        "--patience", type=int, default=15,
+        "--patience",
+        type=int,
+        default=15,
         help="N_max de generaciones sin mejora del HV para detenerse (0 = desactivar)",
     )
     p.add_argument(
-        "--min-delta", type=float, default=1e-4,
+        "--min-delta",
+        type=float,
+        default=1e-4,
         help="mejora mínima de HV normalizado que cuenta como mejora",
+    )
+    p.add_argument(
+        "--use-gradient",
+        action="store_true",
+        help="activa el gradiente por diferencias finitas de la quimiotaxis (por defecto OFF: en este problema "
+        "el decodificador es constante a trozos, el gradiente es siempre 0 y cuesta ~85%% de las evaluaciones)",
+    )
+    p.add_argument(
+        "--keep-degenerate",
+        action="store_true",
+        help="no omitir contratos degenerados (f2 = 0 en >=50%% de los planes aleatorios, "
+        "p.ej. by_surface con 1 contrato)",
     )
     p.add_argument("--n-cancer", type=int, default=40)
     p.add_argument("--n-lymph", type=int, default=15)
     p.add_argument(
-        "--norm-samples", type=int, default=200,
+        "--norm-samples",
+        type=int,
+        default=200,
         help="soluciones aleatorias para fijar el nadir del HV",
     )
 
     # --- Baseline SSA ---
     p.add_argument(
-        "--baseline", choices=["cancer", "ssa", "both"], default="both",
+        "--baseline",
+        choices=["cancer", "ssa", "both"],
+        default="both",
         help="cancer = solo CancerGA; ssa = solo SSA (scaffolding mínimo); both = comparación",
     )
     p.add_argument(
-        "--n-evaluations", type=int, default=20000,
-        help="presupuesto total de evaluaciones para el SSA (repartido entre K pesos)",
+        "--n-evaluations",
+        type=int,
+        default=0,
+        help="presupuesto total de evaluaciones del SSA (repartido entre K pesos). 0 = AUTO: iguala, por "
+        "contrato, el promedio de evaluaciones que gastó CancerGA (comparación a igual presupuesto)",
     )
     p.add_argument(
-        "--ssa-weights", type=int, default=11,
+        "--ssa-weights",
+        type=int,
+        default=11,
         help="número K de pesos (w1, w2) para la escalarización del SSA",
     )
     p.add_argument(
-        "--ssa-neighbor-scale", type=float, default=0.15,
+        "--ssa-neighbor-scale",
+        type=float,
+        default=0.15,
         help="desviación típica del vecindario gaussiano del SSA",
     )
 
     # --- Infraestructura ---
     p.add_argument(
-        "--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 2) - 1),
         help="procesos en paralelo para CancerGA (1 = secuencial)",
     )
     p.add_argument("--out-dir", default="results")
     p.add_argument(
-        "--from-json", default=None,
+        "--from-json",
+        default=None,
         help="reconstruir el dashboard desde un results.json existente",
     )
     return p.parse_args()
@@ -126,10 +160,7 @@ def _validate_args(args):
 
     missing = set(args.contracts) - set(CONTRACT_TYPES)
     if missing:
-        raise SystemExit(
-            f"Contratos no implementados: {sorted(missing)}. "
-            f"Disponibles: {list(CONTRACT_TYPES)}"
-        )
+        raise SystemExit(f"Contratos no implementados: {sorted(missing)}. " f"Disponibles: {list(CONTRACT_TYPES)}")
 
     if "punctual" in args.contracts and any(n > 1 for n in args.n_contracts):
         print(
@@ -148,10 +179,14 @@ def _validate_args(args):
     if args.baseline in ("ssa", "both"):
         if args.ssa_weights < 2:
             raise SystemExit("--ssa-weights debe ser >= 2")
-        if args.n_evaluations < args.ssa_weights:
+        if args.baseline == "ssa" and args.n_evaluations == 0:
             raise SystemExit(
-                f"--n-evaluations ({args.n_evaluations}) debe ser >= "
-                f"--ssa-weights ({args.ssa_weights})"
+                "Con --baseline ssa CancerGA sólo corre como scaffolding (1 generación), así que el presupuesto "
+                "AUTO no aplica: indica --n-evaluations explícito."
+            )
+        if 0 < args.n_evaluations < args.ssa_weights:
+            raise SystemExit(
+                f"--n-evaluations ({args.n_evaluations}) debe ser >= " f"--ssa-weights ({args.ssa_weights})"
             )
 
 
@@ -164,53 +199,51 @@ def _build_instance(args):
 
 def _attach_ssa_baseline(args, results, seeds):
     """
-    Corre SSA por contrato y lo adjunta como `baseline_ssa`.
+    Corre el SSA para cada contrato ejecutado y lo adjunta como `baseline_ssa`.
 
-    - Reutiliza el `common_normalizer` del primer contrato (mismo que CancerGA).
-    - Reconstruye `instance`/`plan` con los mismos defaults.
-    - Se salta `punctual` con `n_contracts != 1` (no aplica).
+    - El SSA optimiza el f2 del contrato (normalizado con el normalizador del propio contrato) y se evalúa
+      en el espacio común (aceite, PVI), igual que CancerGA.
+    - Presupuesto: `--n-evaluations N` fija N evaluaciones; con 0 (AUTO) se iguala, contrato por contrato,
+      el promedio de evaluaciones que gastó CancerGA.
+    - Se itera sobre los contratos que REALMENTE se ejecutaron (no sobre `args.n_contracts`): así `punctual`
+      (siempre n=1) recibe su SSA aunque se pida sólo `--n-contracts 2 3`, y los contratos omitidos por
+      degeneración no se intentan.
     """
     from cancer_ga.baseline import run_ssa
     from cancer_ga.baseline.harvest_adapter import make_harvest_callbacks
 
+    if not results["contracts"]:
+        raise SystemExit("No hay contratos ejecutados a los que adjuntar el baseline SSA.")
+
     instance = _build_instance(args)
     plan, totals, _, _, _ = generate_baseline(instance)
 
-    if not results["contracts"]:
-        raise SystemExit(
-            "No hay contratos en `results` para tomar el common_normalizer. "
-            "Corre primero con --baseline cancer o both."
+    for contract in results["contracts"]:
+        contract_type, n = contract["type"], contract["n_contracts"]
+        if args.n_evaluations > 0:
+            budget = args.n_evaluations
+        else:
+            budget = max(args.ssa_weights, int(round(contract["summary"]["evaluations"]["mean"])))
+        print(f"\n=== SSA baseline — {contract['label']} (presupuesto: {budget:,} evaluaciones) ===")
+        x0, ev, sn = make_harvest_callbacks(
+            instance,
+            plan,
+            totals,
+            contract_type,
+            n_contracts=n,
+            neighbor_scale=args.ssa_neighbor_scale,
         )
-    common_normalizer = results["contracts"][0]["common_normalizer"]
-
-    index = {(c["type"], c["n_contracts"]): c for c in results["contracts"]}
-
-    for contract_type in args.contracts:
-        for n in args.n_contracts:
-            if contract_type == "punctual" and n != 1:
-                continue
-            key = (contract_type, n)
-            if key not in index:
-                continue
-            contract = index[key]
-            print(f"\n=== SSA baseline — {contract['label']} ===")
-            x0, ev, sn = make_harvest_callbacks(
-                instance, plan, totals, contract_type,
-                n_contracts=n,
-                neighbor_scale=args.ssa_neighbor_scale,
-            )
-            ssa_result = run_ssa(
-                x0=x0,
-                evaluate_point=ev,
-                sample_neighbor=sn,
-                norm_contract=contract["normalizer"],
-                common_normalizer=contract["common_normalizer"],
-                seeds=seeds,
-                n_evaluations=args.n_evaluations,
-                K=args.ssa_weights,
-                contract_meta={"type": contract_type, "n_contracts": n},
-            )
-            contract["baseline_ssa"] = ssa_result
+        contract["baseline_ssa"] = run_ssa(
+            x0=x0,
+            evaluate_point=ev,
+            sample_neighbor=sn,
+            norm_contract=contract["normalizer"],
+            common_normalizer=contract["common_normalizer"],
+            seeds=seeds,
+            n_evaluations=budget,
+            K=args.ssa_weights,
+            contract_meta={"type": contract_type, "n_contracts": n},
+        )
 
 
 def _fmt(v):
@@ -221,7 +254,7 @@ def _print_summary(results, skip_cancer=False):
     print("\nResumen (media ± desv. entre semillas; f2 NO se compara entre contratos):")
     header = (
         f"{'Contrato':<28}{'Método':<10}"
-        f"{'Aceite':>14}{'PVI':>8}{'HV':>9}{'Spacing':>10}{'Tiempo(s)':>11}"
+        f"{'Aceite':>14}{'PVI':>8}{'HV':>9}{'Spacing':>10}{'Evals':>9}{'Frente':>8}{'Tiempo(s)':>11}"
     )
     print(header)
     print("-" * len(header))
@@ -236,6 +269,8 @@ def _print_summary(results, skip_cancer=False):
                 f"{s['pvi']['mean']:>8.1f}"
                 f"{s['hv_oil_pvi']['mean']:>9.3f}"
                 f"{_fmt(s.get('spacing', {}).get('mean')):>10}"
+                f"{s['evaluations']['mean']:>9,.0f}"
+                f"{s['front_nd']['mean']:>8.1f}"
                 f"{_fmt(t):>11}"
             )
         if "baseline_ssa" in c:
@@ -246,6 +281,8 @@ def _print_summary(results, skip_cancer=False):
                 f"{bs['pvi']['mean']:>8.1f}"
                 f"{_fmt(bs['hv_oil_pvi']['mean']):>9}"
                 f"{_fmt(bs['spacing']['mean']):>10}"
+                f"{bs['evaluations']['mean']:>9,.0f}"
+                f"{bs['front_nd']['mean']:>8.1f}"
                 f"{_fmt(bs['elapsed_s']['mean']):>11}"
             )
 
@@ -300,12 +337,13 @@ def main():
             contract_types=args.contracts,
             n_contracts_list=args.n_contracts,
             seeds=cancer_seeds,
-            ga_params={"n_cancer": args.n_cancer, "n_lymph": args.n_lymph},
+            ga_params={"n_cancer": args.n_cancer, "n_lymph": args.n_lymph, "use_gradient": args.use_gradient},
             max_generations=cancer_max_gen,
             patience=cancer_patience,
             min_delta=args.min_delta,
             norm_samples=args.norm_samples,
             workers=args.workers,
+            skip_degenerate=not args.keep_degenerate,
         )
 
         if args.baseline in ("ssa", "both"):

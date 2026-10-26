@@ -3,6 +3,8 @@
 from __future__ import annotations
 import numpy as np
 
+MIN_POINTS = 3  # mínimo de puntos para que el espaciado de Schott sea informativo
+
 
 def _ideal_nadir(normalizer):
     if hasattr(normalizer, "ideal"):
@@ -11,25 +13,21 @@ def _ideal_nadir(normalizer):
 
 
 def spacing_to_front(points: list[dict], normalizer) -> dict:
-    """
-    points: [{"oil": float, "pvi": float}, ...]
-    normalizer: ObjectiveNormalizer o {"ideal": [...], "nadir": [...]}
-
-    Devuelve {"spacing": float|None, "n_points": int, "reason": str|None}
-    """
     n = len(points)
     if n == 0:
         return {"spacing": None, "n_points": 0, "reason": "empty_front"}
-    if n == 1:
-        return {"spacing": None, "n_points": 1, "reason": "single_point"}
+    if n < MIN_POINTS:
+        # Con 2 puntos las dos distancias al vecino más cercano son iguales, así que el
+        # espaciado vale 0 POR CONSTRUCCIÓN (no por uniformidad). Con n<3 no es informativo y
+        # sesgaría la comparación a favor del método con frentes más pobres.
+        return {"spacing": None, "n_points": n, "reason": "too_few_points"}
 
     ideal, nadir = _ideal_nadir(normalizer)
     span = nadir - ideal
     if np.any(span <= 0):
         return {"spacing": None, "n_points": n, "reason": "invalid_normalizer"}
 
-    pts = np.array([[(p["oil"] - ideal[0]) / span[0],
-                     (p["pvi"] - ideal[1]) / span[1]] for p in points])
+    pts = np.array([[(p["oil"] - ideal[0]) / span[0], (p["pvi"] - ideal[1]) / span[1]] for p in points])
 
     d = np.empty(n)
     for i in range(n):

@@ -21,6 +21,7 @@ from cancer_ga.benchmarks.harvest import (
     generate_tabali_instance,
     harvest_bounds,
     harvest_is_integer,
+    make_contract_function,
     make_harvest_normalizer,
     make_harvest_objective,
     make_oil_pvi_normalizer,
@@ -63,6 +64,35 @@ def build_instance(instance_cfg):
     raise ValueError("instance.kind debe ser 'tabali' o 'paper'")
 
 
+def count_calls(fn):
+    """Envuelve `fn` contando cuántas veces se evalúa (presupuesto de evaluaciones)."""
+    state = {"n": 0}
+
+    def wrapped(x):
+        state["n"] += 1
+        return fn(x)
+
+    return wrapped, state
+
+
+def zero_f2_fraction(instance, baseline_plan, contract_type, n_contracts, n_samples=100, seed=0):
+    """Fracción de planes aleatorios con f2 == 0. Si es alta, el contrato casi no restringe nada
+    (p.ej. by_surface con 1 contrato: todo está comprometido con el mismo grupo) y el problema
+    bi-objetivo colapsa a mono-objetivo."""
+    f2_fn = make_contract_function(instance, baseline_plan, contract_type, n_contracts)
+    rng = np.random.default_rng(seed)
+    bounds = harvest_bounds(instance)
+    is_int = harvest_is_integer(instance)
+    n = instance.n_lots
+    zeros = 0
+    for _ in range(n_samples):
+        x = rng.uniform(bounds[:, 0], bounds[:, 1])
+        x[is_int] = np.round(x[is_int])
+        plan, _, _ = simulate_plan(instance, x[:n], x[n:])
+        zeros += f2_fn(plan) < 1e-9
+    return zeros / n_samples
+
+
 def plan_to_gantt(plan, n_resources, n_days):
     """Plan disperso {(j,t,k): t} -> matriz densa [recurso][día] de [lote, toneladas] | None."""
     gantt = [[None for _ in range(n_days)] for _ in range(n_resources)]
@@ -87,22 +117,27 @@ def run_single(task):
     norm = make_harvest_normalizer(instance, objective, n_samples=task["norm_samples"])
     common_norm = make_oil_pvi_normalizer(instance, baseline_plan, n_samples=task["norm_samples"])
 
+    # El decodificador es constante a trozos: el gradiente por diferencias finitas es siempre 0 y
+    # consume ~85 % de las evaluaciones. Se apaga por defecto; configurable vía ga_params.
+    ga_kwargs = {"use_gradient": False}
+    ga_kwargs.update(task["ga"])
+    counted_objective, counter = count_calls(objective)  # sólo cuenta las evaluaciones del GA
     ga = CancerGA(
-        objective_function=objective,
+        objective_function=counted_objective,
         n_dim=2 * instance.n_lots,
         bounds=harvest_bounds(instance),
         n_obj=2,
         is_integer=harvest_is_integer(instance),
         seed=task["seed"],
-        use_gradient=False,  # FIX 2: Apagar gradiente para igualar presupuesto
-        **task["ga"],
+        **ga_kwargs,
     )
     out = run_tracked(ga, norm, **task["stop"])
+    n_evaluations = counter["n"]
 
     # FIX 3: Inyectar el plan base en el archivo de CancerGA
-    base_x = np.concatenate([base_team, base_priority])
+    base_x = np.concatenate([base_team, base_priority / max(1, instance.horizon_days - 1)])
     base_obj, _ = objective(base_x)
-    
+
     is_duplicate = any(np.allclose(m["obj"], base_obj, atol=1e-9) for m in out["archive"])
     if not is_duplicate:
         out["archive"].append({"x": base_x, "obj": base_obj})
@@ -133,12 +168,17 @@ def run_single(task):
     rep_i = valid_reps[rep_i_valid]
 
     rep_x, rep_plan, rep_totals = details[rep_i]
+    # True sólo si no hubo NINGUNA solución distinta del plan base en el archivo (p.ej. corridas muy cortas
+    # donde el plan base domina todo lo hallado): esa corrida no aporta un representante informativo.
+    rep_is_baseline = front[rep_i]["pvi"] <= 1e-9
 
     # FIX 5: Spacing sobre los puntos no dominados en el espacio (aceite, PVI)
     pvi_objs = np.array([[-f["oil"], f["pvi"]] for f in front])
     nd_mask_pvi = nondominated_mask(pvi_objs)
     front_nd_pvi = [front[i] for i in range(len(front)) if nd_mask_pvi[i]]
-    
+    for i, f in enumerate(front):
+        f["nd"] = bool(nd_mask_pvi[i])  # no dominado en el espacio común (aceite, PVI)
+
     sp = spacing_to_front(
         [{"oil": f["oil"], "pvi": f["pvi"]} for f in front_nd_pvi],
         common_norm,
@@ -148,15 +188,15 @@ def run_single(task):
     proj = np.array([[-f["oil"], f["pvi"]] for f in front])
     hv_oil_pvi = float(common_norm.hypervolume(proj))
 
-    # Representantes para el análisis estadístico
+    # Representantes para el análisis estadístico (versión liviana, sin planes)
     reps = {
         "knee": front[rep_i],
         "min_pvi": min(front, key=lambda p: p["pvi"]),
-        "max_oil": max(front, key=lambda p: p["oil"])
+        "max_oil": max(front, key=lambda p: p["oil"]),
     }
 
     front.sort(key=lambda f: f["oil"])
-    
+
     return {
         "contract_id": contract_id(ctype, n_c),
         "seed": task["seed"],
@@ -168,8 +208,16 @@ def run_single(task):
         "elapsed_s": float(time.time() - t_start),
         "log": out["log"],
         "front": front,
-        "representative": reps["knee"],
+        # El representante conserva el detalle que consume el dashboard (Gantt y utilización)
+        "representative": dict(
+            reps["knee"],
+            resource_totals=[float(v) for v in rep_totals],
+            gantt=plan_to_gantt(rep_plan, instance.n_resources, instance.horizon_days),
+            x=[float(v) for v in rep_x],
+        ),
         "representatives": reps,
+        "n_evaluations": int(n_evaluations),
+        "representative_is_baseline": bool(rep_is_baseline),
         "normalizer": norm.to_dict(),
         "common_normalizer": common_norm.to_dict(),
         "_baseline_oil": float(baseline_oil),
@@ -195,8 +243,12 @@ def _stats_spacing(runs):
     n_nan = len(runs) - len(vals)
     if not vals:
         return {
-            "mean": None, "std": None, "min": None, "max": None,
-            "n_valid": 0, "n_nan": n_nan,
+            "mean": None,
+            "std": None,
+            "min": None,
+            "max": None,
+            "n_valid": 0,
+            "n_nan": n_nan,
         }
     s = _stats(vals)
     s["n_valid"] = len(vals)
@@ -216,7 +268,10 @@ def summarize_runs(runs):
         "spacing": _stats_spacing(runs),
         "generations": _stats([r["generations_run"] for r in runs]),
         "elapsed_s": _stats([r["elapsed_s"] for r in runs]),
+        "evaluations": _stats([r["n_evaluations"] for r in runs]),
+        "front_nd": _stats([sum(f["nd"] for f in r["front"]) for r in runs]),
         "stopped_by_patience": int(sum(r["stop_reason"] == "patience" for r in runs)),
+        "representative_is_baseline": int(sum(r.get("representative_is_baseline", False) for r in runs)),
     }
 
 
@@ -235,8 +290,13 @@ def run_experiment(
     norm_samples=200,
     workers=1,
     progress=print,
+    skip_degenerate=True,
 ):
-    """Corre todas las combinaciones (contrato × n_contratos × semilla)."""
+    """Corre todas las combinaciones (contrato × n_contratos × semilla).
+
+    Con `skip_degenerate=True` se omiten los contratos cuyo f2 vale 0 en la mitad o más de los planes
+    aleatorios (el problema bi-objetivo colapsaría a mono-objetivo); quedan registrados en
+    `meta["skipped_contracts"]`."""
     ga_params = dict(ga_params or {"n_cancer": 40, "n_lymph": 15})
     stop = {"max_generations": max_generations, "patience": patience, "min_delta": min_delta}
 
@@ -244,6 +304,24 @@ def run_experiment(
     for ctype in contract_types:
         for n_c in ((1,) if ctype == "punctual" else n_contracts_list):
             specs.append((ctype, n_c))
+
+    skipped = []
+    if skip_degenerate:
+        check_instance = build_instance(instance_cfg)
+        check_plan = generate_baseline(check_instance)[0]
+        kept = []
+        for ctype, n_c in specs:
+            frac = zero_f2_fraction(check_instance, check_plan, ctype, n_c)
+            if frac >= 0.5:
+                skipped.append({"id": contract_id(ctype, n_c), "zero_f2_fraction": frac})
+                if progress:
+                    progress(
+                        f"Aviso: se omite {contract_id(ctype, n_c)}: f2 = 0 en {frac:.0%} de los planes "
+                        f"aleatorios (contrato degenerado; usa más contratos agrupados)."
+                    )
+            else:
+                kept.append((ctype, n_c))
+        specs = kept
 
     tasks = [
         {
@@ -325,6 +403,8 @@ def run_experiment(
             "ga_params": ga_params,
             "stop": stop,
             "norm_samples": norm_samples,
+            "use_gradient": ga_params.get("use_gradient", False),
+            "skipped_contracts": skipped,
             "total_runtime_s": float(time.time() - t0),
             "workers": workers,
             "python": sys.version.split()[0],

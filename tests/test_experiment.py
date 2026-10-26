@@ -68,6 +68,9 @@ def test_summarize_runs_statistics():
             "representative": {"oil": o, "f2": 1.0, "pvi": 2.0},
             "hv": 0.5,
             "hv_oil_pvi": 0.4,
+            "spacing": {"spacing": 0.1, "n_points": 5, "reason": None},
+            "n_evaluations": 1000,
+            "front": [{"nd": True}, {"nd": False}, {"nd": True}],
             "generations_run": g,
             "elapsed_s": 1.0,
             "stop_reason": s,
@@ -87,3 +90,47 @@ def test_dashboard_is_self_contained(results, tmp_path):
     assert "Chart.js v4" in html
     assert "const DATA = " in html
     assert "f2 no es comparable entre tipos de contrato" in html
+
+
+def test_representative_keeps_detail_needed_by_dashboard(results):
+    """Regresión: el representante perdió gantt/x/resource_totals y el dashboard no podía dibujarlos."""
+    for c in results["contracts"]:
+        for r in c["runs"]:
+            rep = r["representative"]
+            for key in ("oil", "f2", "pvi", "gantt", "x", "resource_totals"):
+                assert key in rep
+            assert len(rep["resource_totals"]) == results["meta"]["n_resources"]
+
+
+def test_representative_baseline_fallback_is_flagged(results):
+    """El representante excluye el plan base; si el archivo sólo lo contiene, debe quedar marcado."""
+    for c in results["contracts"]:
+        for r in c["runs"]:
+            assert r["representative_is_baseline"] == (r["representative"]["pvi"] <= 1e-9)
+        assert c["summary"]["representative_is_baseline"] == sum(r["representative_is_baseline"] for r in c["runs"])
+
+
+def test_evaluations_are_counted_and_gradient_is_off_by_default(results):
+    assert results["meta"]["use_gradient"] is False
+    for c in results["contracts"]:
+        for r in c["runs"]:
+            # sin gradiente: ~ (población x evaluaciones por generación), no ~(población x n_dim)
+            assert 0 < r["n_evaluations"] < 5000
+        assert c["summary"]["evaluations"]["mean"] > 0
+
+
+def test_front_marks_nondominated_points_in_common_space(results):
+    from cancer_ga.utils.metrics import nondominated_mask
+    import numpy as np
+
+    for c in results["contracts"]:
+        for r in c["runs"]:
+            pts = np.array([[-f["oil"], f["pvi"]] for f in r["front"]])
+            assert [f["nd"] for f in r["front"]] == nondominated_mask(pts).tolist()
+
+
+def test_degenerate_contract_is_skipped_and_reported():
+    inst = {"kind": "tabali", "xlsx_path": str(XLSX), "horizon_days": 45, "seed": 42}
+    res = run_experiment(inst, contract_types=["by_surface"], n_contracts_list=(1, 2), seeds=[0], **FAST)
+    assert [c["id"] for c in res["contracts"]] == ["by_surface_2"]
+    assert [s["id"] for s in res["meta"]["skipped_contracts"]] == ["by_surface_1"]
